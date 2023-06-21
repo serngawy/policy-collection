@@ -1,0 +1,191 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ztp-common
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  annotations:
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+  name: ztp-installplan-policy
+  namespace: ztp-common
+spec:
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: ztp-installplan-policy
+        spec:
+          namespaceSelector:
+            exclude:
+              - kube-*
+            include:
+              - '*'
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: ztp-installplan-approver
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: ztp-installplan-approver
+                rules:
+                  - apiGroups:
+                      - operators.coreos.com
+                    resources:
+                      - installplans
+                      - subscriptions
+                    verbs:
+                      - get
+                      - list
+                      - patch
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: ztp-installplan-approver
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: ztp-installplan-approver
+                subjects:
+                  - kind: ServiceAccount
+                    name: ztp-installplan-approver
+                    namespace: ztp-installplan-approver
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: ztp-installplan-approver
+                  namespace: ztp-installplan-approver
+            - complianceType: mustonlyhave
+              objectDefinition:
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: ztp-installplan-approver
+                  namespace: ztp-installplan-approver
+                spec:
+                  manualSelector: true
+                  selector:
+                    matchLabels:
+                      job-name: installplan-approver
+                  template:
+                    metadata:
+                      labels:
+                        job-name: installplan-approver
+                    spec:
+                      containers:
+                        - image: registry.redhat.io/openshift4/ose-cli
+                          command:
+                            - /bin/bash
+                            - -c
+                            - |
+                              echo "Continue approving operator installPlan for ${WAITTIME}sec ."
+                              end=$((SECONDS+$WAITTIME))
+                              while [ $SECONDS -lt $end ]; do
+                                echo "continue for " $SECONDS " - " $end
+                                oc get subscriptions.operators.coreos.com -A
+                                for subscription in $(oc get subscriptions.operators.coreos.com -A -o jsonpath='{range .items[*]}{.metadata.name}{","}{.metadata.namespace}{"\n"}')
+                                do
+                                  if [ $subscription == "," ]; then
+                                    continue
+                                  fi
+
+                                  if [[ $INCLUDELIST != "" ]]; then
+                                    if [[ $INCLUDELIST != *$subscription* ]]; then
+                                      continue
+                                    else
+                                      echo "Subscription $subscription Included"
+                                    fi
+                                  fi
+
+                                  if [[ $EXCLUDELIST != "" ]]; then
+                                    if [[ $EXCLUDELIST == *$subscription* ]]; then
+                                      echo "Subscription $subscription Excluded"
+                                      continue
+                                    fi
+                                  fi
+
+                                  echo "Processing subscription '$subscription'"
+                                  n=$(echo $subscription | cut -f1 -d,)
+                                  ns=$(echo $subscription | cut -f2 -d,)
+
+                                  installplan=$(oc get subscriptions.operators.coreos.com -n ${ns} --field-selector metadata.name=${n} -o jsonpath='{.items[0].status.installPlanRef.name}')
+                                  installplanNs=$(oc get subscriptions.operators.coreos.com -n ${ns} --field-selector metadata.name=${n} -o jsonpath='{.items[0].status.installPlanRef.namespace}')
+                                  echo "Check installplan approved status"
+                                  oc get installplan $installplan -n $installplanNs -o jsonpath="{.spec.approved}"
+                                  if [ $(oc get installplan $installplan -n $installplanNs -o jsonpath="{.spec.approved}") == "false" ]; then
+                                    echo " - Approving Subscription $subscription with install plan $installplan"
+                                    oc patch installplan $installplan -n $installplanNs --type=json -p='[{"op":"replace","path": "/spec/approved", "value": true}]'
+                                  else
+                                    echo " - Install Plan '$installplan' already approved"
+                                  fi
+                                done
+                              done
+                          imagePullPolicy: IfNotPresent
+                          name: installplan-approver
+                          env:
+                            # set the job running timeout. default is 300s in case the installplan need time to be created.
+                            - name: WAITTIME
+                              value: "300"
+                            # List of subscription to only approve. Subcription Names must be separated with comma ex; logging-sub,storage-sub
+                            # Setting the default value empty string will include all Subcription that have installplan
+                            - name: INCLUDELIST
+                              value: ""
+                            # List of subscription to not approve. Subcription Names must be separated with comma ex; logging-sub,storage-sub
+                            # Setting default value empty string will not exclude any subscriptions
+                            - name: EXCLUDELIST
+                              value: ""
+                      dnsPolicy: ClusterFirst
+                      restartPolicy: OnFailure
+                      serviceAccount: ztp-installplan-approver
+                      serviceAccountName: ztp-installplan-approver
+                      # In order re-approve the installPlan. Uncomment the terminationGracePeriodSeconds the job will be deleted then as the policy in enforce mode the job will be re-created and approve the installPlan.
+                      #terminationGracePeriodSeconds: 360
+                  #activeDeadlineSeconds: 630
+          remediationAction: enforce
+          severity: low
+  remediationAction: enforce
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: ztp-installplan-binding
+  namespace: ztp-common
+placementRef:
+  apiGroup: apps.open-cluster-management.io
+  kind: PlacementRule
+  name: ztp-installplan-rule
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: ztp-installplan-policy
+---
+apiVersion: apps.open-cluster-management.io/v1
+kind: PlacementRule
+metadata:
+  name: ztp-installplan-rule
+  namespace: ztp-common
+spec:
+  clusterConditions:
+    - status: 'True'
+      type: ManagedClusterConditionAvailable
+  clusterSelector:
+    matchExpressions:
+      - key: name
+        operator: NotIn
+        values:
+          - 'local-cluster'
